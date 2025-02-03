@@ -1,119 +1,127 @@
 package main
 
 import (
-    "encoding/json"
-    "fmt"
-    "net/http"
-    "regexp"
-    "strconv"
-    "strings"
-    "time"
+	// "encoding/json"
+	"fmt"
+	"math"
+	"net/http"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
 
-    "github.com/gorilla/mux"
-    "github.com/google/uuid"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 type Receipt struct {
-    Retailer     string  `json:"retailer"`
-    PurchaseDate string  `json:"purchaseDate"`
-    PurchaseTime string  `json:"purchaseTime"`
-    Items        []Item  `json:"items"`
-    Total        string  `json:"total"`
+	Retailer     string  `json:"retailer"`
+	PurchaseDate string  `json:"purchaseDate"`
+	PurchaseTime string  `json:"purchaseTime"`
+	Items        []Item  `json:"items"`
+	Total        string  `json:"total"`
 }
 
 type Item struct {
-    ShortDescription string `json:"shortDescription"`
-    Price            string `json:"price"`
+	ShortDescription string `json:"shortDescription"`
+	Price            string `json:"price"`
 }
 
-type ReceiptResponse struct {
-    ID string `json:"id"`
-}
-
-type PointsResponse struct {
-    Points int `json:"points"`
-}
-
-var receipts = make(map[string]Receipt)
+var (
+	receipts sync.Map
+	mu       sync.Mutex
+)
 
 func main() {
-    r := mux.NewRouter()
-    r.HandleFunc("/receipts/process", processReceipt).Methods("POST")
-    r.HandleFunc("/receipts/{id}/points", getPoints).Methods("GET")
-    http.ListenAndServe(":8080", r)
+	r := gin.Default()
+
+	r.POST("/receipts/process", processReceipt)
+	r.GET("/receipts/:id/points", getPoints)
+
+	r.Run(":8080")
 }
 
-func processReceipt(w http.ResponseWriter, r *http.Request) {
-    var receipt Receipt
-    if err := json.NewDecoder(r.Body).Decode(&receipt); err != nil {
-        http.Error(w, "Invalid receipt", http.StatusBadRequest)
-        return
-    }
+func processReceipt(c *gin.Context) {
+	var receipt Receipt
+	if err := c.ShouldBindJSON(&receipt); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid receipt format"})
+		return
+	}
 
-    id := uuid.New().String()
-    receipts[id] = receipt
+	points := calculatePoints(receipt)
+	id := uuid.New().String()
 
-    response := ReceiptResponse{ID: id}
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(response)
+	mu.Lock()
+	receipts.Store(id, points)
+	mu.Unlock()
+
+	c.JSON(http.StatusOK, gin.H{"id": id})
 }
 
-func getPoints(w http.ResponseWriter, r *http.Request) {
-    vars := mux.Vars(r)
-    id := vars["id"]
+func getPoints(c *gin.Context) {
+	id := c.Param("id")
+	points, ok := receipts.Load(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Receipt not found"})
+		return
+	}
 
-    receipt, exists := receipts[id]
-    if !exists {
-        http.Error(w, "No receipt found for that ID", http.StatusNotFound)
-        return
-    }
-
-    points := calculatePoints(receipt)
-    response := PointsResponse{Points: points}
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(response)
+	c.JSON(http.StatusOK, gin.H{"points": points})
 }
 
 func calculatePoints(receipt Receipt) int {
-    points := 0
+	points := 0
 
-    // One point for every alphanumeric character in the retailer name.
-    points += len(regexp.MustCompile(`[a-zA-Z0-9]`).FindAllString(receipt.Retailer, -1))
+	// Rule 1: Alphanumeric characters in retailer name
+	points += len(regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(receipt.Retailer, ""))
 
-    // 50 points if the total is a round dollar amount with no cents.
-    if strings.HasSuffix(receipt.Total, ".00") {
-        points += 50
-    }
+	// Rule 2: Round dollar amount
+	total, _ := parseMoney(receipt.Total)
+	if total == math.Trunc(total) {
+		points += 50
+	}
 
-    // 25 points if the total is a multiple of 0.25.
-    total, _ := strconv.ParseFloat(receipt.Total, 64)
-    if total*100%25 == 0 {
-        points += 25
-    }
+	// Rule 3: Multiple of 0.25
+	if math.Mod(total, 0.25) == 0 {
+		points += 25
+	}
 
-    // 5 points for every two items on the receipt.
-    points += (len(receipt.Items) / 2) * 5
+	// Rule 4: 5 points per two items
+	points += (len(receipt.Items) / 2) * 5
 
-    // If the trimmed length of the item description is a multiple of 3, multiply the price by 0.2 and round up to the nearest integer.
-    for _, item := range receipt.Items {
-        descLen := len(strings.TrimSpace(item.ShortDescription))
-        if descLen%3 == 0 {
-            price, _ := strconv.ParseFloat(item.Price, 64)
-            points += int(price*0.2 + 0.9999)
-        }
-    }
+	// Rule 5: Item description length multiple of 3
+	for _, item := range receipt.Items {
+		desc := strings.TrimSpace(item.ShortDescription)
+		if len(desc)%3 == 0 {
+			price, _ := parseMoney(item.Price)
+			points += int(math.Ceil(price * 0.2))
+		}
+	}
 
-    // 6 points if the day in the purchase date is odd.
-    date, _ := time.Parse("2006-01-02", receipt.PurchaseDate)
-    if date.Day()%2 != 0 {
-        points += 6
-    }
+	// Rule 6: LLM-generated code bonus
+	if total > 10.0 {
+		points += 5
+	}
 
-    // 10 points if the time of purchase is after 2:00pm and before 4:00pm.
-    time, _ := time.Parse("15:04", receipt.PurchaseTime)
-    if time.Hour() == 14 {
-        points += 10
-    }
+	// Rule 7: Odd purchase day
+	purchaseDate, _ := time.Parse("2006-01-02", receipt.PurchaseDate)
+	if purchaseDate.Day()%2 != 0 {
+		points += 6
+	}
 
-    return points
+	// Rule 8: Purchase time between 2pm and 4pm
+	purchaseTime, _ := time.Parse("15:04", receipt.PurchaseTime)
+	start, _ := time.Parse("15:04", "14:00")
+	end, _ := time.Parse("15:04", "16:00")
+	if purchaseTime.After(start) && purchaseTime.Before(end) {
+		points += 10
+	}
+
+	return points
+}
+
+func parseMoney(s string) (float64, error) {
+	var value float64
+	_, err := fmt.Sscanf(s, "%f", &value)
+	return value, err
 }
